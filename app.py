@@ -1,10 +1,12 @@
-from flask import Flask, render_template_string, request, jsonify, session
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
 import random
 import json
 from sympy import isprime
 import os
+import datetime
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from collections import defaultdict
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -15,13 +17,11 @@ limiter = Limiter(get_remote_address, app=app, default_limits=["10 per minute"])
 WORD_LENGTH = 5
 MAX_ATTEMPTS = 10
 PRIMES_FILE = "five_digit_primes.json"
-
+LEADERBOARD_FILE = "leaderboard.json"
 hint_cooldown = 1  # Allow 1 hint per game session
-
 
 def generate_five_digit_primes():
     return [str(num) for num in range(10000, 100000) if isprime(num)]
-
 
 def load_five_digit_primes():
     if os.path.exists(PRIMES_FILE):
@@ -33,81 +33,27 @@ def load_five_digit_primes():
             json.dump(primes, f)
         return primes
 
-
 FIVE_DIGIT_PRIMES = load_five_digit_primes()
 
+# Deterministically select a prime based on a specific date
+def get_daily_prime(for_date=None):
+    if not for_date:
+        for_date = datetime.date.today()
+    index = for_date.toordinal() % len(FIVE_DIGIT_PRIMES)
+    return FIVE_DIGIT_PRIMES[index]
+
+def load_leaderboard():
+    if os.path.exists(LEADERBOARD_FILE):
+        with open(LEADERBOARD_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_leaderboard(data):
+    with open(LEADERBOARD_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
 HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Numble</title>
-    <style>
-        body { background: #121213; color: white; font-family: Arial, sans-serif; text-align: center; }
-        .grid { display: grid; grid-template-columns: repeat(5, 60px); gap: 10px; justify-content: center; margin-top: 40px; }
-        .cell { width: 60px; height: 60px; font-size: 36px; font-weight: bold; background: #3a3a3c; color: white; display: flex; align-items: center; justify-content: center; border-radius: 4px; }
-        .correct { background: #6aaa64; }
-        .present { background: #c9b458; }
-        .absent { background: #787c7e; }
-        input { font-size: 20px; padding: 10px; width: 200px; margin-top: 20px; }
-        button { padding: 10px 20px; font-size: 16px; background-color: #538d4e; color: white; border: none; cursor: pointer; }
-    </style>
-</head>
-<body>
-    <h1>Numble</h1>
-    <div id="grid"></div>
-    <input type="text" id="guess" maxlength="5" placeholder="Enter 5-digit prime">
-    <button onclick="submitGuess()">Guess</button>
-    <button onclick="getHint()">Hint</button>
-    <p id="message"></p>
-
-    <script>
-        let attempts = 0;
-        const maxAttempts = {{ max_attempts }};
-
-        function createRow(guess, feedback) {
-            const grid = document.getElementById('grid');
-            const row = document.createElement('div');
-            row.className = 'grid';
-            for (let i = 0; i < guess.length; i++) {
-                const cell = document.createElement('div');
-                cell.className = 'cell ' + feedback[i];
-                cell.innerText = guess[i];
-                row.appendChild(cell);
-            }
-            grid.appendChild(row);
-        }
-
-        function submitGuess() {
-            const guess = document.getElementById('guess').value;
-            fetch('/guess', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ guess })
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.error) {
-                    document.getElementById('message').innerText = data.error;
-                    return;
-                }
-                createRow(data.guess, data.feedback);
-                document.getElementById('message').innerText = data.message;
-                document.getElementById('guess').value = '';
-            });
-        }
-
-        function getHint() {
-            fetch('/hint')
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById('message').innerText = data.hint;
-            });
-        }
-    </script>
-</body>
-</html>
+<!-- HTML template placeholder -->
 """
 
 def get_feedback(guess, target):
@@ -133,8 +79,10 @@ def get_feedback(guess, target):
 
 @app.before_request
 def initialize_game():
+    if 'date' not in session:
+        session['date'] = str(datetime.date.today())
     if 'target_number' not in session:
-        session['target_number'] = random.choice(FIVE_DIGIT_PRIMES)
+        session['target_number'] = get_daily_prime()
         session['guess_history'] = []
         session['hints_used'] = 0
 
@@ -163,7 +111,12 @@ def guess():
     session['guess_history'] = guess_history
 
     if guess == target_number:
-        return jsonify({"guess": guess, "feedback": feedback, "message": "Congratulations! You guessed it! 🎉"})
+        date_str = session['date']
+        leaderboard = load_leaderboard()
+        leaderboard.setdefault(date_str, []).append(len(guess_history))
+        save_leaderboard(leaderboard)
+        result_str = ''.join([f"[{f[0]}]" for f in guess_history])
+        return jsonify({"guess": guess, "feedback": feedback, "message": "Congratulations! You guessed it! 🎉", "share": result_str})
     elif len(guess_history) >= MAX_ATTEMPTS:
         return jsonify({"guess": guess, "feedback": feedback, "message": f"Game Over! The number was {target_number}."})
     else:
@@ -187,6 +140,26 @@ def hint():
         session['hints_used'] = session.get('hints_used', 0) + 1
         return jsonify({"hint": f"Digit {i+1} is {target_number[i]}"})
     return jsonify({"hint": "All digits have been revealed."})
+
+@app.route("/leaderboard")
+def leaderboard():
+    board = load_leaderboard()
+    today = str(datetime.date.today())
+    entries = board.get(today, [])
+    return jsonify({"date": today, "entries": entries})
+
+@app.route("/game/<date>")
+def game_by_date(date):
+    try:
+        target_date = datetime.datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        return "Invalid date format. Use YYYY-MM-DD."
+    session.clear()
+    session['target_number'] = get_daily_prime(target_date)
+    session['guess_history'] = []
+    session['hints_used'] = 0
+    session['date'] = str(target_date)
+    return redirect(url_for("home"))
 
 if __name__ == "__main__":
     app.run(debug=True)
